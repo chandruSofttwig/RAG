@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Launcher: builds the jar on first use, then runs it with all arguments.
+set -euo pipefail
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+JAR="$DIR/target/local-rag.jar"
+if [[ ! -f "$JAR" ]]; then
+  echo "Building local-rag (first run)…" >&2
+  (cd "$DIR" && mvn -q -DskipTests package)
+fi
+exec java --enable-native-access=ALL-UNNAMED ${RAG_JAVA_OPTS:-} -jar "$JAR" "$@"

@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Local RAG</title>
+<style>
+  :root {
+    --bg: #f7f7f5; --panel: #ffffff; --text: #1d1d1b; --muted: #6b6b66; --border: #e3e3de;
+    --accent: #2f6f4f; --accent-text: #ffffff; --code: #f1f1ec; --error: #b3261e;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #151514; --panel: #1e1e1c; --text: #ecece8; --muted: #9a9a93; --border: #33332f;
+      --accent: #6fbf8f; --accent-text: #0f1a14; --code: #262623; --error: #f2b8b5;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 15px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 900px; margin: 0 auto; padding: 24px 16px 64px; }
+  header { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+  h1 { font-size: 20px; margin: 0; }
+  .status { color: var(--muted); font-size: 13px; }
+  form { display: flex; gap: 8px; margin: 20px 0 8px; flex-wrap: wrap; }
+  input[type=text] { flex: 1 1 320px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px;
+                     background: var(--panel); color: var(--text); font: inherit; }
+  select, button { padding: 10px 12px; border-radius: 8px; border: 1px solid var(--border);
+                   background: var(--panel); color: var(--text); font: inherit; cursor: pointer; }
+  button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+  button:disabled { opacity: .6; cursor: default; }
+  .diag { color: var(--muted); font-size: 12px; margin: 4px 0 16px; min-height: 1em; }
+  .answer { background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+            padding: 16px; white-space: pre-wrap; margin-bottom: 20px; }
+  .answer:empty { display: none; }
+  .error { color: var(--error); }
+  .hit { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; margin-bottom: 10px; }
+  .hit summary { padding: 10px 14px; cursor: pointer; display: flex; gap: 10px; flex-wrap: wrap; }
+  .hit .loc { font-family: ui-monospace, Menlo, monospace; font-size: 13px; overflow-wrap: anywhere; }
+  .hit .scores { color: var(--muted); font-size: 12px; margin-left: auto; }
+  pre { margin: 0; padding: 12px 14px; background: var(--code); border-top: 1px solid var(--border);
+        overflow-x: auto; font-size: 12.5px; border-radius: 0 0 10px 10px; }
+  details.index { margin-top: 32px; color: var(--muted); }
+  details.index form { margin-top: 8px; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Local RAG</h1>
+    <span class="status" id="status">checking…</span>
+  </header>
+
+  <form id="ask">
+    <input type="text" id="q" placeholder="Ask a question about your indexed files…" autocomplete="off" required>
+    <select id="mode" aria-label="Retrieval mode">
+      <option value="hybrid">hybrid</option>
+      <option value="bm25">bm25</option>
+      <option value="semantic">semantic</option>
+    </select>
+    <button class="primary" id="askBtn" type="submit">Ask</button>
+    <button id="searchBtn" type="button">Search only</button>
+  </form>
+  <div class="diag" id="diag"></div>
+  <div class="answer" id="answer"></div>
+  <div id="hits"></div>
+
+  <details class="index">
+    <summary>Re-index</summary>
+    <form id="indexForm">
+      <input type="text" id="paths" placeholder="/absolute/path/to/project (comma-separate several)">
+      <label><input type="checkbox" id="embed" checked> embeddings</label>
+      <button type="submit" id="indexBtn">Index</button>
+    </form>
+  </details>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+async function refreshStatus() {
+  try {
+    const s = await (await fetch("/api/status")).json();
+    const idx = s.index;
+    $("status").textContent = idx
+      ? `${idx.chunks} chunks · ${idx.embeddingModel ?? "BM25 only"} · chat ${s.chatModel}`
+      : "no index yet — use Re-index below";
+    if (s.ollamaError) $("status").textContent += " · Ollama unreachable";
+  } catch { $("status").textContent = "server unreachable"; }
+}
+
+function renderDiag(d) {
+  let t = `${d.mode} · ${d.queryType} · bm25 ${d.bm25Candidates} / semantic ${d.semanticCandidates}`;
+  if (d.bm25Weight != null) t += ` · weights ${d.bm25Weight}/${d.semanticWeight}`;
+  t += ` · ${d.elapsedMs} ms`;
+  if (d.skipReason && d.mode === "HYBRID") t += ` · semantic skipped: ${d.skipReason}`;
+  $("diag").textContent = t;
+}
+
+function renderHits(hits) {
+  $("hits").innerHTML = hits.map(h => `
+    <details class="hit">
+      <summary><span>[${h.rank}]</span>
+        <span class="loc">${esc(h.path)}:${h.startLine}-${h.endLine}${h.symbol ? " (" + esc(h.symbol) + ")" : ""}</span>
+        <span class="scores">bm25 ${h.bm25Score ?? "–"} · cos ${h.semanticScore ?? "–"}</span></summary>
+      <pre>${esc(h.text)}</pre>
+    </details>`).join("");
+}
+
+function busy(on) { for (const b of ["askBtn", "searchBtn"]) $(b).disabled = on; }
+
+$("searchBtn").onclick = async () => {
+  const query = $("q").value.trim(); if (!query) return;
+  busy(true); $("answer").textContent = ""; $("hits").innerHTML = "";
+  try {
+    const r = await fetch("/api/search", {method: "POST", body: JSON.stringify({query, mode: $("mode").value})});
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.error);
+    renderDiag(data.diagnostics); renderHits(data.hits);
+  } catch (e) { $("answer").innerHTML = `<span class="error">${esc(e.message)}</span>`; }
+  finally { busy(false); }
+};
+
+$("ask").onsubmit = async (ev) => {
+  ev.preventDefault();
+  const question = $("q").value.trim(); if (!question) return;
+  busy(true); $("answer").textContent = "…"; $("hits").innerHTML = ""; $("diag").textContent = "retrieving…";
+  let started = false;
+  try {
+    const r = await fetch("/api/ask", {method: "POST", body: JSON.stringify({question, mode: $("mode").value})});
+    if (!r.ok) throw new Error((await r.json()).error);
+    const reader = r.body.getReader(); const dec = new TextDecoder(); let buf = "";
+    for (;;) {
+      const {value, done} = await reader.read(); if (done) break;
+      buf += dec.decode(value, {stream: true});
+      let nl;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, nl); buf = buf.slice(nl + 1);
+        if (!line.trim()) continue;
+        const ev = JSON.parse(line);
+        if (ev.type === "sources") { renderDiag(ev.diagnostics); renderHits(ev.hits); }
+        else if (ev.type === "token") { if (!started) { $("answer").textContent = ""; started = true; } $("answer").textContent += ev.text; }
+        else if (ev.type === "error") throw new Error(ev.error);
+      }
+    }
+  } catch (e) { $("answer").innerHTML = `<span class="error">${esc(e.message)}</span>`; }
+  finally { busy(false); }
+};
+
+$("indexForm").onsubmit = async (ev) => {
+  ev.preventDefault();
+  const paths = $("paths").value.split(",").map(s => s.trim()).filter(Boolean); if (!paths.length) return;
+  $("indexBtn").disabled = true; $("status").textContent = "indexing… (embedding on CPU can take a while)";
+  try {
+    const r = await fetch("/api/index", {method: "POST", body: JSON.stringify({paths, embed: $("embed").checked})});
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.error);
+    await refreshStatus();
+  } catch (e) { $("status").innerHTML = `<span class="error">index failed: ${esc(e.message)}</span>`; }
+  finally { $("indexBtn").disabled = false; }
+};
+
+refreshStatus();
+</script>
+</body>
+</html>
